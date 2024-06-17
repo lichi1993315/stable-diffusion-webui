@@ -1,3 +1,6 @@
+import oss2
+import tensorrt
+import torch
 import base64
 import io
 import os
@@ -15,10 +18,11 @@ from fastapi.exceptions import HTTPException
 from fastapi.responses import JSONResponse
 from fastapi.encoders import jsonable_encoder
 from secrets import compare_digest
-
+import uuid
 import modules.shared as shared
 from modules import sd_samplers, deepbooru, sd_hijack, images, scripts, ui, postprocessing, errors, restart, shared_items
 from modules.api import models
+from modules.api.rembg_mine import my_remove
 from modules.shared import opts
 from modules.processing import StableDiffusionProcessingTxt2Img, StableDiffusionProcessingImg2Img, process_images
 from modules.textual_inversion.textual_inversion import create_embedding, train_embedding
@@ -32,7 +36,121 @@ from modules import devices
 from typing import Dict, List, Any
 import piexif
 import piexif.helper
+from dotenv import load_dotenv
 from contextlib import closing
+from qcloud_cos import CosConfig
+from qcloud_cos import CosS3Client
+from qcloud_cos.cos_comm import CiDetectType
+import pytz
+
+import boto3
+import pngquant
+
+pngquant.config('/snap/bin/pngquant', min_quality=90, max_quality=90, ndeep=1, ndigits=12)
+load_dotenv()
+
+secret_id = os.getenv('SECRET_ID')
+secret_key = os.getenv('SECRET_KEY')
+buck_name = os.getenv('BUCKET_NAME')
+# region =  os.getenv('REGION')
+# token = None
+# scheme = 'https'
+# endpoint = 'cos.accelerate.myqcloud.com'
+
+
+
+region = None
+token = None
+scheme = 'https'
+endpoint = 'aigames-1255694434.cos.ap-shanghai.myqcloud.com'
+config = CosConfig(Region=region, SecretId=secret_id, SecretKey=secret_key, Token=token,
+                        Endpoint=endpoint,
+                        Scheme=scheme)
+client = CosS3Client(config)
+
+s3_client = boto3.client('s3')
+s3_bucket_name = 'spokemon-bucket'
+
+from rembg import new_session
+import onnxruntime as rt
+
+providers = [
+    'TensorrtExecutionProvider',
+    'CUDAExecutionProvider'
+]
+
+
+def return_provider():
+    return providers
+
+
+rt.get_available_providers = return_provider
+print(rt.get_available_providers())
+
+#session1 = new_session("isnet-anime")
+#session2 = new_session("isnet-general-use")
+#session1 = new_session("isnet-anime", rt.get_available_providers())
+#print("session 1 init over", flush=True)
+#session2 = new_session("isnet-general-use", rt.get_available_providers())
+#print("session 2 init over", flush=True)
+
+sessions = []
+
+output_path = os.getenv("OUTPUT_PATH")
+def upload_file_to_tencent(client, bucket,image_bytes, object_key):
+        pil_image = image_bytes
+
+        mem_file = BytesIO()
+        print("upload_file_to_tencent save")
+
+        pil_image.save(mem_file, format='png')
+        mem_file.flush()
+        mem_file.seek(0)
+
+        response = client.put_object(
+            Bucket=None,
+            Body=mem_file.getvalue(),
+            Key=object_key
+        )
+        print(object_key)
+if not os.path.exists(output_path):
+    os.makedirs(output_path)
+
+def upload_file_to_oss(image_bytes, object_key):
+    BUCKET_NAME="agentlive-bucket-shanghai"
+    ENDPOINT="oss-cn-shanghai.aliyuncs.com"
+    ACCESS_KEY_ID="LTAI5t8TZXq9kFuf7q6aj6vm"
+    ACCESS_KEY_SECRET="clEBTfTYAVVedW2iSSgjyAcKwYpKri"
+
+    auth = oss2.Auth(ACCESS_KEY_ID, ACCESS_KEY_SECRET)
+    bucket = oss2.Bucket(auth, ENDPOINT, BUCKET_NAME)
+    pil_image = image_bytes
+
+    mem_file = BytesIO()
+    print("upload_file_to_oss save")
+
+    pil_image.save(mem_file, format='png')
+    mem_file.flush()
+    mem_file.seek(0)
+
+    bucket.put_object(object_key, mem_file.getvalue())
+    print(object_key)
+
+def upload_file_to_aws_s3(client, bucket, image_bytes, object_key):
+    pil_image = image_bytes
+
+    mem_file = BytesIO()
+
+    pil_image.save(mem_file, format='png')
+    mem_file.flush()
+    mem_file.seek(0)
+
+    response = client.put_object(
+        Bucket=bucket,
+        Body=mem_file.getvalue(),
+        Key=object_key
+    )
+    print(object_key)
 
 
 def script_name_to_index(name, scripts):
@@ -336,7 +454,11 @@ class Api:
                         script_args[alwayson_script.args_from + idx] = request.alwayson_scripts[alwayson_script_name]["args"][idx]
         return script_args
 
+    
+    
     def text2imgapi(self, txt2imgreq: models.StableDiffusionTxt2ImgProcessingAPI):
+        start_time = time.time()
+        
         script_runner = scripts.scripts_txt2img
         if not script_runner.scripts:
             script_runner.initialize_scripts(False)
@@ -383,8 +505,71 @@ class Api:
                     shared.total_tqdm.clear()
 
         b64images = list(map(encode_pil_to_base64, processed.images)) if send_images else []
+        images_path = []
+        now = datetime.datetime.now(pytz.timezone('Asia/Shanghai'))
+        today = now.date()
+        urls = []
+        # url = client.get_presigned_url(
+        #     Method='GET',
+        #     Bucket=None,
+        #     Key=cos_key,
+        #     Expired=24 * 60 * 60
+        # )
+        for b64 in b64images:
+            #读取b64，存储在output文件夹下
+            uid = uuid.uuid4()
+            filename = str(uid) + ".png"
+            cos_key = f"bkm/{today}/{filename}"
+            image_data = base64.b64decode(b64)
+            image = Image.open(io.BytesIO(image_data)).convert('RGBA')
+            st = time.time()
+            if len(sessions) == 0:
+                session1 = new_session("isnet-anime", rt.get_available_providers())
+                print("session 1 init over", flush=True)
+                session2 = new_session("isnet-general-use", rt.get_available_providers())
+                print("session 2 init over", flush=True)
+                sessions.append(session1)
+                sessions.append(session2)
+            imgByteArr = BytesIO()
+            image.save(imgByteArr, format="PNG")
+            image = imgByteArr.getvalue()
+            compressed_ratio, compressed_image = pngquant.quant_data(image)
+            print(f"quant cost:{time.time() - st}s", flush=True)
 
-        return models.TextToImageResponse(images=b64images, parameters=vars(txt2imgreq), info=processed.js())
+            st = time.time()
+            image = Image.open(BytesIO(compressed_image))
+            rmbg_image = my_remove(image,alpha_matting=True,post_process_mask=True, session=sessions)
+            print(f"remove cost:{time.time() - st}s", flush=True)
+
+            st = time.time()
+            imgByteArr = BytesIO()
+            print("my_remove type", type(rmbg_image))
+            rmbg_image.save(imgByteArr, format="PNG")
+            rmbg_image = imgByteArr.getvalue()
+
+            compressed_ratio, compressed_image = pngquant.quant_data(rmbg_image)
+            print(f"quant2 cost:{time.time() - st}s", flush=True)
+
+            st = time.time()
+            compressed_image = Image.open(BytesIO(compressed_image))
+            # 切除边框
+            crop_box = (3, 3, compressed_image.width - 3, compressed_image.height - 3)
+            compressed_image = compressed_image.crop(crop_box) 
+            upload_file_to_oss(compressed_image,cos_key)
+            #upload_file_to_tencent(client, buck_name, compressed_image, cos_key)
+            print(f"upload tencent cost:{time.time() - st}", flush=True)
+            #upload_file_to_aws_s3(s3_client, s3_bucket_name, compressed_image, cos_key)
+            print(f"upload s3 cost:{time.time() - st}", flush=True)
+            url = f"https://agentlive-bucket-shanghai.oss-cn-shanghai.aliyuncs.com/{cos_key}" 
+            urls.append(url)
+        end_time = time.time()
+
+        elapsed_time = end_time - start_time
+
+        print(f"text2imgapi total time:{elapsed_time}s", flush=True)
+
+        return models.TextToImageResponse(parameters=urls, info=urls[0])
+
 
     def img2imgapi(self, img2imgreq: models.StableDiffusionImg2ImgProcessingAPI):
         init_images = img2imgreq.init_images
