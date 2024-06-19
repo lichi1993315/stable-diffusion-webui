@@ -2,6 +2,7 @@ __pycache__
 /modules/api/.env
 launch.log
 launch_err.log
+*.log
 *.ckpt
 *.safetensors
 *.pth
