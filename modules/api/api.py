@@ -119,8 +119,8 @@ if not os.path.exists(output_path):
 def upload_file_to_oss(image_bytes, object_key):
     BUCKET_NAME="agentlive-bucket-shanghai"
     ENDPOINT="oss-cn-shanghai.aliyuncs.com"
-    ACCESS_KEY_ID="LTAI5t8TZXq9kFuf7q6aj6vm"
-    ACCESS_KEY_SECRET="clEBTfTYAVVedW2iSSgjyAcKwYpKri"
+    ACCESS_KEY_ID=os.getenv('OSS_ACCESS_KEY')
+    ACCESS_KEY_SECRET=os.getenv('OSS_ACCESS_SECRET')
 
     auth = oss2.Auth(ACCESS_KEY_ID, ACCESS_KEY_SECRET)
     bucket = oss2.Bucket(auth, ENDPOINT, BUCKET_NAME)
