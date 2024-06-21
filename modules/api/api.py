@@ -119,8 +119,8 @@ if not os.path.exists(output_path):
 def upload_file_to_oss(image_bytes, object_key):
     BUCKET_NAME="agentlive-bucket-shanghai"
     ENDPOINT="oss-cn-shanghai.aliyuncs.com"
-    ACCESS_KEY_ID="LTAI5t8TZXq9kFuf7q6aj6vm"
-    ACCESS_KEY_SECRET="clEBTfTYAVVedW2iSSgjyAcKwYpKri"
+    ACCESS_KEY_ID=os.getenv('OSS_ACCESS_KEY')
+    ACCESS_KEY_SECRET=os.getenv('OSS_ACCESS_SECRET')
 
     auth = oss2.Auth(ACCESS_KEY_ID, ACCESS_KEY_SECRET)
     bucket = oss2.Bucket(auth, ENDPOINT, BUCKET_NAME)
@@ -453,8 +453,6 @@ class Api:
                     for idx in range(0, min((alwayson_script.args_to - alwayson_script.args_from), len(request.alwayson_scripts[alwayson_script_name]["args"]))):
                         script_args[alwayson_script.args_from + idx] = request.alwayson_scripts[alwayson_script_name]["args"][idx]
         return script_args
-
-    
     
     def text2imgapi(self, txt2imgreq: models.StableDiffusionTxt2ImgProcessingAPI):
         start_time = time.time()
@@ -570,8 +568,9 @@ class Api:
 
         return models.TextToImageResponse(parameters=urls, info=urls[0])
 
-
     def img2imgapi(self, img2imgreq: models.StableDiffusionImg2ImgProcessingAPI):
+        start_time = time.time()
+        
         init_images = img2imgreq.init_images
         if init_images is None:
             raise HTTPException(status_code=404, detail="Init image not found")
@@ -588,19 +587,19 @@ class Api:
             self.default_script_arg_img2img = self.init_default_script_args(script_runner)
         selectable_scripts, selectable_script_idx = self.get_selectable_script(img2imgreq.script_name, script_runner)
 
-        populate = img2imgreq.copy(update={  # Override __init__ params
+        populate = img2imgreq.copy(update={
             "sampler_name": validate_sampler_name(img2imgreq.sampler_name or img2imgreq.sampler_index),
             "do_not_save_samples": not img2imgreq.save_images,
             "do_not_save_grid": not img2imgreq.save_images,
             "mask": mask,
         })
         if populate.sampler_name:
-            populate.sampler_index = None  # prevent a warning later on
+            populate.sampler_index = None
 
         args = vars(populate)
-        args.pop('include_init_images', None)  # this is meant to be done by "exclude": True in model, but it's for a reason that I cannot determine.
+        args.pop('include_init_images', None)
         args.pop('script_name', None)
-        args.pop('script_args', None)  # will refeed them to the pipeline directly after initializing them
+        args.pop('script_args', None)
         args.pop('alwayson_scripts', None)
 
         script_args = self.init_script_args(img2imgreq, self.default_script_arg_img2img, selectable_scripts, selectable_script_idx, script_runner)
@@ -620,21 +619,75 @@ class Api:
                     shared.state.begin(job="scripts_img2img")
                     if selectable_scripts is not None:
                         p.script_args = script_args
-                        processed = scripts.scripts_img2img.run(p, *p.script_args) # Need to pass args as list here
+                        processed = scripts.scripts_img2img.run(p, *p.script_args)
                     else:
-                        p.script_args = tuple(script_args) # Need to pass args as tuple here
+                        p.script_args = tuple(script_args)
                         processed = process_images(p)
                 finally:
                     shared.state.end()
                     shared.total_tqdm.clear()
 
         b64images = list(map(encode_pil_to_base64, processed.images)) if send_images else []
+        images_path = []
+        now = datetime.datetime.now(pytz.timezone('Asia/Shanghai'))
+        today = now.date()
+        urls = []
+
+        for b64 in b64images:
+            uid = uuid.uuid4()
+            filename = str(uid) + ".png"
+            cos_key = f"bkm/{today}/{filename}"
+            image_data = base64.b64decode(b64)
+            image = Image.open(io.BytesIO(image_data)).convert('RGBA')
+            st = time.time()
+            if len(sessions) == 0:
+                session1 = new_session("isnet-anime", rt.get_available_providers())
+                print("session 1 init over", flush=True)
+                session2 = new_session("isnet-general-use", rt.get_available_providers())
+                print("session 2 init over", flush=True)
+                sessions.append(session1)
+                sessions.append(session2)
+            imgByteArr = BytesIO()
+            image.save(imgByteArr, format="PNG")
+            image = imgByteArr.getvalue()
+            compressed_ratio, compressed_image = pngquant.quant_data(image)
+            print(f"quant cost:{time.time() - st}s", flush=True)
+
+            st = time.time()
+            image = Image.open(BytesIO(compressed_image))
+            rmbg_image = my_remove(image,alpha_matting=True,post_process_mask=True, session=sessions)
+            print(f"remove cost:{time.time() - st}s", flush=True)
+
+            st = time.time()
+            imgByteArr = BytesIO()
+            print("my_remove type", type(rmbg_image))
+            rmbg_image.save(imgByteArr, format="PNG")
+            rmbg_image = imgByteArr.getvalue()
+
+            compressed_ratio, compressed_image = pngquant.quant_data(rmbg_image)
+            print(f"quant2 cost:{time.time() - st}s", flush=True)
+
+            st = time.time()
+            compressed_image = Image.open(BytesIO(compressed_image))
+            crop_box = (3, 3, compressed_image.width - 3, compressed_image.height - 3)
+            compressed_image = compressed_image.crop(crop_box) 
+            upload_file_to_oss(compressed_image,cos_key)
+            print(f"upload tencent cost:{time.time() - st}", flush=True)
+            print(f"upload s3 cost:{time.time() - st}", flush=True)
+            url = f"https://agentlive-bucket-shanghai.oss-cn-shanghai.aliyuncs.com/{cos_key}" 
+            urls.append(url)
+        end_time = time.time()
+
+        elapsed_time = end_time - start_time
+
+        print(f"img2imgapi total time:{elapsed_time}s", flush=True)
 
         if not img2imgreq.include_init_images:
             img2imgreq.init_images = None
             img2imgreq.mask = None
 
-        return models.ImageToImageResponse(images=b64images, parameters=vars(img2imgreq), info=processed.js())
+        return models.ImageToImageResponse(parameters=urls, info=urls[0])
+
 
     def extras_single_image_api(self, req: models.ExtrasSingleImageRequest):
         reqDict = setUpscalers(req)
