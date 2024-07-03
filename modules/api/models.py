@@ -131,10 +131,15 @@ class TextToImageResponse(BaseModel):
     # images: Optional[List[str]] = Field(default=None, title="Image", description="The generated image in base64 format.")
     parameters: List[str]
     info: str
+    
+class TextToImageOriResponse(BaseModel):
+    images: list[str] = Field(default=None, title="Image", description="The generated image in base64 format.")
+    parameters: dict
+    info: str
 
 class ImageToImageResponse(BaseModel):
-    images: List[str] = Field(default=None, title="Image", description="The generated image in base64 format.")
-    parameters: dict
+    # images: List[str] = Field(default=None, title="Image", description="The generated image in base64 format.")
+    parameters: List[str]
     info: str
 
 class ExtrasBaseRequest(BaseModel):

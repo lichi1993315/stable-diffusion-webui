@@ -329,6 +329,7 @@ class Api:
         api_middleware(self.app)
         self.add_api_route("/sdapi/v1/txt2img", self.text2imgapi, methods=["POST"], response_model=models.TextToImageResponse)
         self.add_api_route("/sdapi/v1/img2img", self.img2imgapi, methods=["POST"], response_model=models.ImageToImageResponse)
+        self.add_api_route("/sdapi/v1/txt2imgori", self.text2imgoriapi, methods=["POST"], response_model=models.TextToImageOriResponse)
         self.add_api_route("/sdapi/v1/extra-single-image", self.extras_single_image_api, methods=["POST"], response_model=models.ExtrasSingleImageResponse)
         self.add_api_route("/sdapi/v1/extra-batch-images", self.extras_batch_images_api, methods=["POST"], response_model=models.ExtrasBatchImagesResponse)
         self.add_api_route("/sdapi/v1/png-info", self.pnginfoapi, methods=["POST"], response_model=models.PNGInfoResponse)
@@ -568,9 +569,61 @@ class Api:
 
         return models.TextToImageResponse(parameters=urls, info=urls[0])
 
-    def img2imgapi(self, img2imgreq: models.StableDiffusionImg2ImgProcessingAPI):
+    def text2imgoriapi(self, txt2imgreq: models.StableDiffusionTxt2ImgProcessingAPI):
         start_time = time.time()
         
+        script_runner = scripts.scripts_txt2img   
+        selectable_scripts, selectable_script_idx = self.get_selectable_script(txt2imgreq.script_name, script_runner)
+
+        populate = txt2imgreq.copy(update={  # Override __init__ params
+            "sampler_name": validate_sampler_name(txt2imgreq.sampler_name or txt2imgreq.sampler_index),
+            "do_not_save_samples": not txt2imgreq.save_images,
+            "do_not_save_grid": not txt2imgreq.save_images,
+        })
+        if populate.sampler_name:
+            populate.sampler_index = None  # prevent a warning later on
+
+        args = vars(populate)
+        args.pop('script_name', None)
+        args.pop('script_args', None) # will refeed them to the pipeline directly after initializing them
+        args.pop('alwayson_scripts', None)
+
+        script_args = self.init_script_args(txt2imgreq, self.default_script_arg_txt2img, selectable_scripts, selectable_script_idx, script_runner)
+
+        send_images = args.pop('send_images', True)
+        args.pop('save_images', None)
+
+        with self.queue_lock:
+            with closing(StableDiffusionProcessingTxt2Img(sd_model=shared.sd_model, **args)) as p:
+                p.is_api = True
+                p.scripts = script_runner
+                p.outpath_grids = opts.outdir_txt2img_grids
+                p.outpath_samples = opts.outdir_txt2img_samples
+
+                try:
+                    shared.state.begin(job="scripts_txt2img")
+                    if selectable_scripts is not None:
+                        p.script_args = script_args
+                        processed = scripts.scripts_txt2img.run(p, *p.script_args)
+                    else:
+                        p.script_args = tuple(script_args)
+                        processed = process_images(p)
+                finally:
+                    shared.state.end()
+                    shared.total_tqdm.clear()
+
+        b64images = list(map(encode_pil_to_base64, processed.images)) if send_images else []
+        end_time = time.time()
+        
+        elapsed_time = end_time - start_time
+        
+        print(f"text2imgapi total time:{elapsed_time}s", flush=True)
+
+        return models.TextToImageOriResponse(images=b64images, parameters=vars(txt2imgreq), info=processed.js())
+    
+    def img2imgapi(self, img2imgreq: models.StableDiffusionImg2ImgProcessingAPI):
+        start_time = time.time()
+
         init_images = img2imgreq.init_images
         if init_images is None:
             raise HTTPException(status_code=404, detail="Init image not found")
@@ -578,10 +631,10 @@ class Api:
         mask = img2imgreq.mask
         if mask:
             mask = decode_base64_to_image(mask)
-
+        
         script_runner = scripts.scripts_img2img
         if not script_runner.scripts:
-            script_runner.initialize_scripts(True)
+            script_runner.initialize_scripts(False)
             ui.create_ui()
         if not self.default_script_arg_img2img:
             self.default_script_arg_img2img = self.init_default_script_args(script_runner)
@@ -670,11 +723,11 @@ class Api:
             st = time.time()
             compressed_image = Image.open(BytesIO(compressed_image))
             crop_box = (3, 3, compressed_image.width - 3, compressed_image.height - 3)
-            compressed_image = compressed_image.crop(crop_box) 
+            compressed_image = compressed_image.crop(crop_box)
             upload_file_to_oss(compressed_image,cos_key)
             print(f"upload tencent cost:{time.time() - st}", flush=True)
             print(f"upload s3 cost:{time.time() - st}", flush=True)
-            url = f"https://agentlive-bucket-shanghai.oss-cn-shanghai.aliyuncs.com/{cos_key}" 
+            url = f"https://agentlive-bucket-shanghai.oss-cn-shanghai.aliyuncs.com/{cos_key}"
             urls.append(url)
         end_time = time.time()
 
@@ -687,7 +740,6 @@ class Api:
             img2imgreq.mask = None
 
         return models.ImageToImageResponse(parameters=urls, info=urls[0])
-
 
     def extras_single_image_api(self, req: models.ExtrasSingleImageRequest):
         reqDict = setUpscalers(req)
