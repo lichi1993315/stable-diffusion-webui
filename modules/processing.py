@@ -34,6 +34,8 @@ from ldm.models.diffusion.ddpm import LatentDepth2ImageDiffusion
 from einops import repeat, rearrange
 from blendmodes.blend import blendLayers, BlendType
 
+import time
+from PIL import Image, ImageOps, ImageDraw, ImageEnhance, ImageFilter
 
 # some of those options should not be changed at all because they would break the model, so I removed them from options.
 opt_C = 4
@@ -1152,6 +1154,67 @@ def old_hires_fix_first_pass_dimensions(width, height):
 
     return width, height
 
+def intermediate_image_post_process(image, mode='r'):
+    print(f" intermediate_image_post_process 开始", flush=True)
+    CACHE_PATH = os.path.join("/home/pc", "cache")
+    desired_size = image.size[0]
+    old_size = int(desired_size * 0.9)
+    resized_image = image.resize((old_size, old_size))
+    buffer_width = 0.1 * desired_size
+    delta_w = desired_size - old_size
+    delta_h = desired_size - old_size
+    padding = (delta_w // 2, delta_h // 2, delta_w - (delta_w // 2), delta_h - (delta_h // 2))
+
+    new_image = Image.new('RGB', (desired_size, desired_size), (255, 255, 255))
+    new_image.paste(resized_image, (padding[0], padding[1]))
+    new_image.save(os.path.join(CACHE_PATH, "intermediate_image_raw.png"))
+
+    mask = Image.new('L', (desired_size, desired_size), 255)
+    draw = ImageDraw.Draw(mask)
+
+    # Circular Mask
+    if mode == 'c':
+        mask_np = np.zeros((desired_size, desired_size), dtype=np.uint8)
+        center = (desired_size // 2, desired_size // 2)
+        print(f" intermediate_image_post_process desired_size: {desired_size}, old_size: {old_size}", flush=True)
+        max_radius = desired_size // 2
+        min_radius = max(0, max_radius - buffer_width)
+
+        for x in range(desired_size):
+            for y in range(desired_size):
+                distance_to_center = np.sqrt((x - center[0]) ** 2 + (y - center[1]) ** 2)
+                if distance_to_center > max_radius:
+                    mask_np[x, y] = 0
+                elif distance_to_center < min_radius:
+                    mask_np[x, y] = 255
+                else:
+                    mask_np[x, y] = max(0, int(255 * (
+                            1 - 1.75 * (distance_to_center - min_radius) / (max_radius - min_radius))))
+
+        mask = Image.fromarray(mask_np, mode='L')
+    # Rectangular Mask
+    else:
+        for i in range(buffer_width):
+            opacity = int(255 * (i / buffer_width))
+            # Top gradient
+            draw.line([(padding[0] + i, padding[1] + i), (desired_size - padding[2] - i, padding[1] + i)], fill=opacity)
+            # Bottom gradient
+            draw.line([(padding[0] + i, desired_size - padding[3] - i),
+                       (desired_size - padding[2] - i, desired_size - padding[3] - i)], fill=opacity)
+            # Left gradient
+            draw.line([(padding[0] + i, padding[1] + i), (padding[0] + i, desired_size - padding[3] - i)], fill=opacity)
+            # Right gradient
+            draw.line([(desired_size - padding[2] - i, padding[1] + i),
+                       (desired_size - padding[2] - i, desired_size - padding[3] - i)], fill=opacity)
+
+    final_image = Image.composite(new_image, Image.new('RGB', (desired_size, desired_size), (255, 255, 255)), mask)
+
+    color_enhancer = ImageEnhance.Color(final_image)
+    final_image = color_enhancer.enhance(1.2)
+    final_image.save(os.path.join(CACHE_PATH, "intermediate_image.png"))
+
+    return final_image
+
 
 @dataclass(repr=False)
 class StableDiffusionProcessingTxt2Img(StableDiffusionProcessing):
@@ -1169,6 +1232,8 @@ class StableDiffusionProcessingTxt2Img(StableDiffusionProcessing):
     hr_scheduler: str = None
     hr_prompt: str = ''
     hr_negative_prompt: str = ''
+    remove_bg: bool = True
+
     force_task_id: str = None
 
     cached_hr_uc = [None, None]
@@ -1296,10 +1361,15 @@ class StableDiffusionProcessingTxt2Img(StableDiffusionProcessing):
                 self.extra_generation_params["Hires upscaler"] = self.hr_upscaler
 
     def sample(self, conditioning, unconditional_conditioning, seeds, subseeds, subseed_strength, prompts):
+        print(f" sd-sample:开始sample!", flush=True)
         self.sampler = sd_samplers.create_sampler(self.sampler_name, self.sd_model)
 
         if self.firstpass_image is not None and self.enable_hr:
+            print(f" sd-sample:firstpass_image 非空!", flush=True)
             # here we don't need to generate image, we just take self.firstpass_image and prepare it for hires fix
+
+            
+
 
             if self.latent_scale_mode is None:
                 image = np.array(self.firstpass_image).astype(np.float32) / 255.0 * 2.0 - 1.0
@@ -1323,6 +1393,7 @@ class StableDiffusionProcessingTxt2Img(StableDiffusionProcessing):
 
         else:
             # here we generate an image normally
+            print(f" sd-sample:firstpass_image 为空! self.latent_scale_mode:{self.latent_scale_mode}", flush=True)
 
             x = self.rng.next()
             samples = self.sampler.sample(self, x, conditioning, unconditional_conditioning, image_conditioning=self.txt2img_image_conditioning(x))
@@ -1344,6 +1415,7 @@ class StableDiffusionProcessingTxt2Img(StableDiffusionProcessing):
         return self.sample_hr_pass(samples, decoded_samples, seeds, subseeds, subseed_strength, prompts)
 
     def sample_hr_pass(self, samples, decoded_samples, seeds, subseeds, subseed_strength, prompts):
+        print(f" sd-sample_hr_pass:开始sample hr!", flush=True)
         if shared.state.interrupted:
             return samples
 
@@ -1368,11 +1440,37 @@ class StableDiffusionProcessingTxt2Img(StableDiffusionProcessing):
         self.sampler = sd_samplers.create_sampler(img2img_sampler_name, self.sd_model)
 
         if self.latent_scale_mode is not None:
+            print(f" sd-latent_scale_mode:非空!", flush=True)
             for i in range(samples.shape[0]):
                 save_intermediate(samples, i)
 
             samples = torch.nn.functional.interpolate(samples, size=(target_height // opt_f, target_width // opt_f), mode=self.latent_scale_mode["mode"], antialias=self.latent_scale_mode["antialias"])
 
+            # 在latent HighRes中加入处理
+            processed_samples = torch.clamp((samples + 1.0) / 2.0, min=0.0, max=1.0)
+            batch_images = []
+            for i, x_sample in enumerate(processed_samples):
+                x_sample = 255. * np.moveaxis(x_sample.cpu().numpy(), 0, 2)
+                x_sample = x_sample.astype(np.uint8)
+                image = Image.fromarray(x_sample)
+                # 在做HighRes Fix之前,处理外边框
+                start = time.time()
+                image = intermediate_image_post_process(image, 'c')
+                end = time.time()
+                print(f" sd-process耗时:{end - start}", flush=True)
+                
+                image = images.resize_image(0, image, target_width, target_height)
+                image = np.array(image).astype(np.float32) / 255.0
+                image = np.moveaxis(image, 2, 0)
+                batch_images.append(image)
+                
+            processed_samples = torch.from_numpy(np.array(batch_images))
+            processed_samples = processed_samples.to(shared.device, dtype=devices.dtype_vae)
+
+            if opts.sd_vae_encode_method != 'Full':
+                self.extra_generation_params['VAE Encoder'] = opts.sd_vae_encode_method
+            samples = images_tensor_to_samples(processed_samples, approximation_indexes.get(opts.sd_vae_encode_method))
+            
             # Avoid making the inpainting conditioning unless necessary as
             # this does need some extra compute to decode / encode the image again.
             if getattr(self, "inpainting_mask_weight", shared.opts.inpainting_mask_weight) < 1.0:
@@ -1380,6 +1478,7 @@ class StableDiffusionProcessingTxt2Img(StableDiffusionProcessing):
             else:
                 image_conditioning = self.txt2img_image_conditioning(samples)
         else:
+            print(f" sd-latent_scale_mode:为空!", flush=True)
             lowres_samples = torch.clamp((decoded_samples + 1.0) / 2.0, min=0.0, max=1.0)
 
             batch_images = []
@@ -1389,6 +1488,12 @@ class StableDiffusionProcessingTxt2Img(StableDiffusionProcessing):
                 image = Image.fromarray(x_sample)
 
                 save_intermediate(image, i)
+                
+                # 在做HighRes Fix之前,处理外边框
+                start = time.time()
+                image = intermediate_image_post_process(image, 'c')
+                end = time.time()
+                print(f" sd-process耗时:{end - start}", flush=True)
 
                 image = images.resize_image(0, image, target_width, target_height, upscaler_name=self.hr_upscaler)
                 image = np.array(image).astype(np.float32) / 255.0
@@ -1545,6 +1650,7 @@ class StableDiffusionProcessingImg2Img(StableDiffusionProcessing):
     inpainting_mask_invert: int = 0
     initial_noise_multiplier: float = None
     latent_mask: Image = None
+    remove_bg: bool = True
     force_task_id: str = None
 
     image_mask: Any = field(default=None, init=False)

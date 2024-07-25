@@ -1,3 +1,6 @@
+import oss2
+import tensorrt
+import torch
 import base64
 import io
 import os
@@ -15,23 +18,145 @@ from fastapi.exceptions import HTTPException
 from fastapi.responses import JSONResponse
 from fastapi.encoders import jsonable_encoder
 from secrets import compare_digest
-
+import uuid
 import modules.shared as shared
 from modules import sd_samplers, deepbooru, sd_hijack, images, scripts, ui, postprocessing, errors, restart, shared_items, script_callbacks, infotext_utils, sd_models, sd_schedulers
 from modules.api import models
+from modules.api.rembg_mine import my_remove
 from modules.shared import opts
 from modules.processing import StableDiffusionProcessingTxt2Img, StableDiffusionProcessingImg2Img, process_images
 from modules.textual_inversion.textual_inversion import create_embedding, train_embedding
 from modules.hypernetworks.hypernetwork import create_hypernetwork, train_hypernetwork
-from PIL import PngImagePlugin
+from PIL import PngImagePlugin, Image
 from modules.sd_models_config import find_checkpoint_config_near_filename
 from modules.realesrgan_model import get_realesrgan_models
 from modules import devices
 from typing import Any
 import piexif
 import piexif.helper
+from dotenv import load_dotenv
 from contextlib import closing
+from qcloud_cos import CosConfig
+from qcloud_cos import CosS3Client
+from qcloud_cos.cos_comm import CiDetectType
+import pytz
+import uuid
+from PIL import Image
+import boto3
+import pngquant
 from modules.progress import create_task_id, add_task_to_queue, start_task, finish_task, current_task
+
+pngquant.config('/snap/bin/pngquant', min_quality=90, max_quality=90, ndeep=1, ndigits=12)
+load_dotenv()
+
+secret_id = os.getenv('SECRET_ID')
+secret_key = os.getenv('SECRET_KEY')
+buck_name = os.getenv('BUCKET_NAME')
+# region =  os.getenv('REGION')
+# token = None
+# scheme = 'https'
+# endpoint = 'cos.accelerate.myqcloud.com'
+
+
+region = None
+token = None
+scheme = 'https'
+endpoint = 'aigames-1255694434.cos.ap-shanghai.myqcloud.com'
+config = CosConfig(Region=region, SecretId=secret_id, SecretKey=secret_key, Token=token,
+                   Endpoint=endpoint,
+                   Scheme=scheme)
+client = CosS3Client(config)
+
+s3_client = boto3.client('s3')
+s3_bucket_name = 'spokemon-bucket'
+
+from rembg import new_session
+import onnxruntime as rt
+
+providers = [
+    'TensorrtExecutionProvider',
+    'CUDAExecutionProvider'
+]
+
+
+def return_provider():
+    return providers
+
+
+rt.get_available_providers = return_provider
+print(rt.get_available_providers())
+
+# session1 = new_session("isnet-anime")
+# session2 = new_session("isnet-general-use")
+# session1 = new_session("isnet-anime", rt.get_available_providers())
+# print("session 1 init over", flush=True)
+# session2 = new_session("isnet-general-use", rt.get_available_providers())
+# print("session 2 init over", flush=True)
+
+sessions = []
+
+output_path = os.getenv("OUTPUT_PATH")
+
+
+def upload_file_to_tencent(client, bucket, image_bytes, object_key):
+    pil_image = image_bytes
+
+    mem_file = BytesIO()
+    print("upload_file_to_tencent save")
+
+    pil_image.save(mem_file, format='png')
+    mem_file.flush()
+    mem_file.seek(0)
+
+    response = client.put_object(
+        Bucket=None,
+        Body=mem_file.getvalue(),
+        Key=object_key
+    )
+    print(object_key)
+
+
+if not os.path.exists(output_path):
+    os.makedirs(output_path)
+
+
+def upload_file_to_oss(image_bytes, object_key):
+    BUCKET_NAME = "agentlive-bucket-shanghai"
+    ENDPOINT = "oss-cn-shanghai.aliyuncs.com"
+    ACCESS_KEY_ID = os.getenv('OSS_ACCESS_KEY')
+    ACCESS_KEY_SECRET = os.getenv('OSS_ACCESS_SECRET')
+
+    auth = oss2.Auth(ACCESS_KEY_ID, ACCESS_KEY_SECRET)
+    bucket = oss2.Bucket(auth, ENDPOINT, BUCKET_NAME)
+    pil_image = image_bytes
+
+    mem_file = BytesIO()
+    print("upload_file_to_oss save")
+
+    pil_image.save(mem_file, format='png')
+    mem_file.flush()
+    mem_file.seek(0)
+
+    bucket.put_object(object_key, mem_file.getvalue())
+    print(object_key)
+
+
+def upload_file_to_aws_s3(client, bucket, image_bytes, object_key):
+    pil_image = image_bytes
+
+    mem_file = BytesIO()
+
+    pil_image.save(mem_file, format='png')
+    mem_file.flush()
+    mem_file.seek(0)
+
+    response = client.put_object(
+        Bucket=bucket,
+        Body=mem_file.getvalue(),
+        Key=object_key
+    )
+    print(object_key)
+
 
 def script_name_to_index(name, scripts):
     try:
@@ -430,6 +555,9 @@ class Api:
         return params
 
     def text2imgapi(self, txt2imgreq: models.StableDiffusionTxt2ImgProcessingAPI):
+        start_time = time.time()
+        if_remove_bg = txt2imgreq.remove_bg
+
         task_id = txt2imgreq.force_task_id or create_task_id("txt2img")
 
         script_runner = scripts.scripts_txt2img
@@ -482,10 +610,148 @@ class Api:
                     shared.total_tqdm.clear()
 
         b64images = list(map(encode_pil_to_base64, processed.images)) if send_images else []
+        
+        st = time.time()
+        print(f"before postprocess cost:{time.time() - st}s", flush=True)
+        
+        images_path = []
+        now = datetime.datetime.now(pytz.timezone('Asia/Shanghai'))
+        today = now.date()
+        urls = []
+        # url = client.get_presigned_url(
+        #     Method='GET',
+        #     Bucket=None,
+        #     Key=cos_key,
+        #     Expired=24 * 60 * 60
+        # )
+        for b64 in b64images:
+            # 读取b64，存储在output文件夹下
+            uid = uuid.uuid4()
+            filename = str(uid) + ".png"
+            cos_key = f"bkm/{today}/{filename}"
+            image_data = base64.b64decode(b64)
+            image = Image.open(io.BytesIO(image_data)).convert('RGBA')
+            st = time.time()
+            if len(sessions) == 0:
+                session1 = new_session("isnet-anime", rt.get_available_providers())
+                print("session 1 init over", flush=True)
+                session2 = new_session("isnet-general-use", rt.get_available_providers())
+                print("session 2 init over", flush=True)
+                sessions.append(session1)
+                sessions.append(session2)
+            
+            is_pngquant = False
+
+            print(f"if_remove_bg: {if_remove_bg}", flush=True)
+            if if_remove_bg:
+
+                if is_pngquant:
+                    imgByteArr = BytesIO()
+                    image.save(imgByteArr, format="PNG")
+                    image_to_quant = imgByteArr.getvalue()
+                    compressed_ratio, compressed_image = pngquant.quant_data(image_to_quant)
+                    print(f"quant cost:{time.time() - st}s", flush=True)
+                    st = time.time()
+                    image = Image.open(BytesIO(compressed_image))
+                rmbg_image = my_remove(image, alpha_matting=True, post_process_mask=True, session=sessions)
+                print(f"remove cost:{time.time() - st}s", flush=True)
+
+                st = time.time()
+                if is_pngquant:
+                    imgByteArr = BytesIO()
+                    rmbg_image.save(imgByteArr, format="PNG")
+                    rmbg_image = imgByteArr.getvalue()
+
+                    compressed_ratio, compressed_image = pngquant.quant_data(rmbg_image)
+                    print(f"quant2 cost:{time.time() - st}s", flush=True)
+                    compressed_image = Image.open(BytesIO(compressed_image))
+                else:
+                    compressed_image = rmbg_image
+            st = time.time()
+            
+            # 切除边框
+            crop_box = (3, 3, compressed_image.width - 3, compressed_image.height - 3)
+            compressed_image = compressed_image.crop(crop_box)
+            upload_file_to_oss(compressed_image, cos_key)
+            # upload_file_to_tencent(client, buck_name, compressed_image, cos_key)
+            print(f"upload tencent cost:{time.time() - st}", flush=True)
+            # upload_file_to_aws_s3(s3_client, s3_bucket_name, compressed_image, cos_key)
+            print(f"upload s3 cost:{time.time() - st}", flush=True)
+            url = f"https://agentlive-bucket-shanghai.oss-cn-shanghai.aliyuncs.com/{cos_key}"
+            urls.append(url)
+        end_time = time.time()
+
+        elapsed_time = end_time - start_time
+
+        print(f"text2imgapi total time:{elapsed_time}s", flush=True)
+
+        # models.TextToImageResponse(images=b64images, parameters=vars(txt2imgreq), info=processed.js())
+        return models.TextToImageResponse(parameters={"url": urls[0]}, info=urls[0])
+
+    def text2imgoriapi(self, txt2imgreq: models.StableDiffusionTxt2ImgProcessingAPI):
+        task_id = txt2imgreq.force_task_id or create_task_id("txt2img")
+
+        script_runner = scripts.scripts_txt2img
+
+        infotext_script_args = {}
+        self.apply_infotext(txt2imgreq, "txt2img", script_runner=script_runner,
+                            mentioned_script_args=infotext_script_args)
+
+        selectable_scripts, selectable_script_idx = self.get_selectable_script(txt2imgreq.script_name, script_runner)
+
+        populate = txt2imgreq.copy(update={  # Override __init__ params
+            "sampler_name": validate_sampler_name(txt2imgreq.sampler_name or txt2imgreq.sampler_index),
+            "do_not_save_samples": not txt2imgreq.save_images,
+            "do_not_save_grid": not txt2imgreq.save_images,
+        })
+        if populate.sampler_name:
+            populate.sampler_index = None  # prevent a warning later on
+
+        args = vars(populate)
+        args.pop('script_name', None)
+        args.pop('script_args', None)  # will refeed them to the pipeline directly after initializing them
+        args.pop('alwayson_scripts', None)
+        args.pop('infotext', None)
+
+        script_args = self.init_script_args(txt2imgreq, self.default_script_arg_txt2img, selectable_scripts,
+                                            selectable_script_idx, script_runner,
+                                            input_script_args=infotext_script_args)
+
+        send_images = args.pop('send_images', True)
+        args.pop('save_images', None)
+
+        add_task_to_queue(task_id)
+
+        with self.queue_lock:
+            with closing(StableDiffusionProcessingTxt2Img(sd_model=shared.sd_model, **args)) as p:
+                p.is_api = True
+                p.scripts = script_runner
+                p.outpath_grids = opts.outdir_txt2img_grids
+                p.outpath_samples = opts.outdir_txt2img_samples
+
+                try:
+                    shared.state.begin(job="scripts_txt2img")
+                    start_task(task_id)
+                    if selectable_scripts is not None:
+                        p.script_args = script_args
+                        processed = scripts.scripts_txt2img.run(p, *p.script_args)  # Need to pass args as list here
+                    else:
+                        p.script_args = tuple(script_args)  # Need to pass args as tuple here
+                        processed = process_images(p)
+                    finish_task(task_id)
+                finally:
+                    shared.state.end()
+                    shared.total_tqdm.clear()
+
+        b64images = list(map(encode_pil_to_base64, processed.images)) if send_images else []
 
         return models.TextToImageResponse(images=b64images, parameters=vars(txt2imgreq), info=processed.js())
 
     def img2imgapi(self, img2imgreq: models.StableDiffusionImg2ImgProcessingAPI):
+        start_time = time.time()
+
+        if_remove_bg = img2imgreq.remove_bg
+
         task_id = img2imgreq.force_task_id or create_task_id("img2img")
 
         init_images = img2imgreq.init_images
@@ -549,12 +815,65 @@ class Api:
                     shared.total_tqdm.clear()
 
         b64images = list(map(encode_pil_to_base64, processed.images)) if send_images else []
+        images_path = []
+        now = datetime.datetime.now(pytz.timezone('Asia/Shanghai'))
+        today = now.date()
+        urls = []
+
+        for b64 in b64images:
+            uid = uuid.uuid4()
+            filename = str(uid) + ".png"
+            cos_key = f"bkm/{today}/{filename}"
+            image_data = base64.b64decode(b64)
+            image = Image.open(io.BytesIO(image_data)).convert('RGBA')
+            st = time.time()
+            if len(sessions) == 0:
+                session1 = new_session("isnet-anime", rt.get_available_providers())
+                print("session 1 init over", flush=True)
+                session2 = new_session("isnet-general-use", rt.get_available_providers())
+                print("session 2 init over", flush=True)
+                sessions.append(session1)
+                sessions.append(session2)
+            imgByteArr = BytesIO()
+            image.save(imgByteArr, format="PNG")
+            image = imgByteArr.getvalue()
+            compressed_ratio, compressed_image = pngquant.quant_data(image)
+            print(f"quant cost:{time.time() - st}s", flush=True)
+            if if_remove_bg:
+                st = time.time()
+                image = Image.open(BytesIO(compressed_image))
+                rmbg_image = my_remove(image, alpha_matting=True, post_process_mask=True, session=sessions)
+                print(f"remove cost:{time.time() - st}s", flush=True)
+
+                st = time.time()
+                imgByteArr = BytesIO()
+                print("my_remove type", type(rmbg_image))
+                rmbg_image.save(imgByteArr, format="PNG")
+                rmbg_image = imgByteArr.getvalue()
+
+                compressed_ratio, compressed_image = pngquant.quant_data(rmbg_image)
+                print(f"quant2 cost:{time.time() - st}s", flush=True)
+
+            st = time.time()
+            compressed_image = Image.open(BytesIO(compressed_image))
+            crop_box = (3, 3, compressed_image.width - 3, compressed_image.height - 3)
+            compressed_image = compressed_image.crop(crop_box)
+            upload_file_to_oss(compressed_image, cos_key)
+            print(f"upload tencent cost:{time.time() - st}", flush=True)
+            print(f"upload s3 cost:{time.time() - st}", flush=True)
+            url = f"https://agentlive-bucket-shanghai.oss-cn-shanghai.aliyuncs.com/{cos_key}"
+            urls.append(url)
+        end_time = time.time()
+
+        elapsed_time = end_time - start_time
+
+        print(f"img2imgapi total time:{elapsed_time}s", flush=True)
 
         if not img2imgreq.include_init_images:
             img2imgreq.init_images = None
             img2imgreq.mask = None
 
-        return models.ImageToImageResponse(images=b64images, parameters=vars(img2imgreq), info=processed.js())
+        return models.ImageToImageResponse(parameters={"url": urls[0]}, info=urls[0])
 
     def extras_single_image_api(self, req: models.ExtrasSingleImageRequest):
         reqDict = setUpscalers(req)
