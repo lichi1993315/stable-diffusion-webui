@@ -457,6 +457,7 @@ class Api:
     
     def text2imgapi(self, txt2imgreq: models.StableDiffusionTxt2ImgProcessingAPI):
         start_time = time.time()
+        if_remove_bg = txt2imgreq.remove_bg
         
         script_runner = scripts.scripts_txt2img
         if not script_runner.scripts:
@@ -534,20 +535,23 @@ class Api:
             image = imgByteArr.getvalue()
             compressed_ratio, compressed_image = pngquant.quant_data(image)
             print(f"quant cost:{time.time() - st}s", flush=True)
+            
+            print(f"if_remove_bg: {if_remove_bg}", flush=True)
 
-            st = time.time()
-            image = Image.open(BytesIO(compressed_image))
-            rmbg_image = my_remove(image,alpha_matting=True,post_process_mask=True, session=sessions)
-            print(f"remove cost:{time.time() - st}s", flush=True)
+            if if_remove_bg:
+                st = time.time()
+                image = Image.open(BytesIO(compressed_image))
+                rmbg_image = my_remove(image,alpha_matting=True,post_process_mask=True, session=sessions)
+                print(f"remove cost:{time.time() - st}s", flush=True)
 
-            st = time.time()
-            imgByteArr = BytesIO()
-            print("my_remove type", type(rmbg_image))
-            rmbg_image.save(imgByteArr, format="PNG")
-            rmbg_image = imgByteArr.getvalue()
+                st = time.time()
+                imgByteArr = BytesIO()
+                print("my_remove type", type(rmbg_image))
+                rmbg_image.save(imgByteArr, format="PNG")
+                rmbg_image = imgByteArr.getvalue()
 
-            compressed_ratio, compressed_image = pngquant.quant_data(rmbg_image)
-            print(f"quant2 cost:{time.time() - st}s", flush=True)
+                compressed_ratio, compressed_image = pngquant.quant_data(rmbg_image)
+                print(f"quant2 cost:{time.time() - st}s", flush=True)
 
             st = time.time()
             compressed_image = Image.open(BytesIO(compressed_image))
@@ -623,7 +627,8 @@ class Api:
     
     def img2imgapi(self, img2imgreq: models.StableDiffusionImg2ImgProcessingAPI):
         start_time = time.time()
-
+        
+        if_remove_bg = img2imgreq.remove_bg
         init_images = img2imgreq.init_images
         if init_images is None:
             raise HTTPException(status_code=404, detail="Init image not found")
@@ -705,20 +710,20 @@ class Api:
             image = imgByteArr.getvalue()
             compressed_ratio, compressed_image = pngquant.quant_data(image)
             print(f"quant cost:{time.time() - st}s", flush=True)
+            if if_remove_bg:
+                st = time.time()
+                image = Image.open(BytesIO(compressed_image))
+                rmbg_image = my_remove(image,alpha_matting=True,post_process_mask=True, session=sessions)
+                print(f"remove cost:{time.time() - st}s", flush=True)
 
-            st = time.time()
-            image = Image.open(BytesIO(compressed_image))
-            rmbg_image = my_remove(image,alpha_matting=True,post_process_mask=True, session=sessions)
-            print(f"remove cost:{time.time() - st}s", flush=True)
+                st = time.time()
+                imgByteArr = BytesIO()
+                print("my_remove type", type(rmbg_image))
+                rmbg_image.save(imgByteArr, format="PNG")
+                rmbg_image = imgByteArr.getvalue()
 
-            st = time.time()
-            imgByteArr = BytesIO()
-            print("my_remove type", type(rmbg_image))
-            rmbg_image.save(imgByteArr, format="PNG")
-            rmbg_image = imgByteArr.getvalue()
-
-            compressed_ratio, compressed_image = pngquant.quant_data(rmbg_image)
-            print(f"quant2 cost:{time.time() - st}s", flush=True)
+                compressed_ratio, compressed_image = pngquant.quant_data(rmbg_image)
+                print(f"quant2 cost:{time.time() - st}s", flush=True)
 
             st = time.time()
             compressed_image = Image.open(BytesIO(compressed_image))

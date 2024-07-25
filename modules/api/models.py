@@ -106,6 +106,7 @@ StableDiffusionTxt2ImgProcessingAPI = PydanticModelGenerator(
         {"key": "script_args", "type": list, "default": []},
         {"key": "send_images", "type": bool, "default": True},
         {"key": "save_images", "type": bool, "default": False},
+        {"key": "remove_bg", "type": bool, "default": True},
         {"key": "alwayson_scripts", "type": dict, "default": {}},
     ]
 ).generate_model()
@@ -123,6 +124,7 @@ StableDiffusionImg2ImgProcessingAPI = PydanticModelGenerator(
         {"key": "script_args", "type": list, "default": []},
         {"key": "send_images", "type": bool, "default": True},
         {"key": "save_images", "type": bool, "default": False},
+        {"key": "remove_bg", "type": bool, "default": True},
         {"key": "alwayson_scripts", "type": dict, "default": {}},
     ]
 ).generate_model()
